@@ -1,9 +1,13 @@
 using System.Collections.Concurrent;
+using Microsoft.AspNetCore.SignalR;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Dang ky OrderStore Singleton trong Dependency Injection
 builder.Services.AddSingleton<OrderStore>();
+
+// Dang ky SignalR service
+builder.Services.AddSignalR();
 
 var app = builder.Build();
 
@@ -28,8 +32,8 @@ app.MapGet("/orders/{id:guid}", (OrderStore store, Guid id) =>
     return Results.Ok(order);
 });
 
-// POST /orders: tiep nhan va kiem tra tinh hop le cua don hang moi
-app.MapPost("/orders", (OrderStore store, CreateOrderRequest? request) =>
+// POST /orders: tiep nhan don hang moi, khoi chay mo phong xu ly va day su kien SignalR
+app.MapPost("/orders", (OrderStore store, IHubContext<OrderHub> hubContext, CreateOrderRequest? request) =>
 {
     if (request is null || string.IsNullOrWhiteSpace(request.CustomerName))
     {
@@ -54,6 +58,7 @@ app.MapPost("/orders", (OrderStore store, CreateOrderRequest? request) =>
         .ToList();
 
     var totalAmount = orderItems.Sum(i => i.Quantity * i.UnitPrice);
+    var now = DateTimeOffset.UtcNow;
 
     var order = new OrderDto(
         Id: Guid.NewGuid(),
@@ -61,15 +66,90 @@ app.MapPost("/orders", (OrderStore store, CreateOrderRequest? request) =>
         Items: orderItems,
         TotalAmount: totalAmount,
         Status: "Pending",
-        CreatedAt: DateTimeOffset.UtcNow
+        CreatedAt: now,
+        UpdatedAt: now
     );
 
     store.AddOrder(order);
 
+    // Khoi chay tac vu nen mo phong xu ly don hang bat dong bo
+    _ = Task.Run(() => SimulateOrderProcessingAsync(order.Id, store, hubContext));
+
     return Results.Created($"/orders/{order.Id}", order);
 });
 
+// Anh xa SignalR Hub
+app.MapHub<OrderHub>("/hubs/orders");
+
 app.Run();
+
+// Ham mo phong quy trinh xu ly don hang theo yeu cau thoi gian thuc cua De tai 01
+static async Task SimulateOrderProcessingAsync(Guid orderId, OrderStore store, IHubContext<OrderHub> hubContext)
+{
+    try
+    {
+        // 1. Sau 1.5 giay: Chuyen trang thai tu "Pending" sang "Processing"
+        await Task.Delay(1500);
+
+        var processingTime = DateTimeOffset.UtcNow;
+        if (store.TryUpdateStatus(orderId, "Processing", processingTime, out var processingOrder, out var oldStatus) && processingOrder is not null)
+        {
+            var msgProcessing = new OrderStatusChangedMessage(
+                OrderId: orderId,
+                CustomerName: processingOrder.CustomerName,
+                OldStatus: oldStatus,
+                NewStatus: "Processing",
+                UpdatedAt: processingTime,
+                Reason: null
+            );
+
+            await hubContext.Clients.Group($"order:{orderId}").SendAsync("OrderStatusChanged", msgProcessing);
+        }
+
+        // 2. Sau 2 giay tiep theo: Kiem tra neu co san pham mang ProductId == "OUT_OF_STOCK"
+        await Task.Delay(2000);
+
+        var finalTime = DateTimeOffset.UtcNow;
+        if (store.TryGetOrder(orderId, out var currentOrder) && currentOrder is not null)
+        {
+            bool isOutOfStock = currentOrder.Items.Any(i => string.Equals(i.ProductId, "OUT_OF_STOCK", StringComparison.OrdinalIgnoreCase));
+            string targetStatus = isOutOfStock ? "Failed" : "Completed";
+            string? reason = isOutOfStock ? "San pham OUT_OF_STOCK da het hang trong kho." : null;
+
+            if (store.TryUpdateStatus(orderId, targetStatus, finalTime, out var finalOrder, out var prevStatus) && finalOrder is not null)
+            {
+                var msgFinal = new OrderStatusChangedMessage(
+                    OrderId: orderId,
+                    CustomerName: finalOrder.CustomerName,
+                    OldStatus: prevStatus,
+                    NewStatus: targetStatus,
+                    UpdatedAt: finalTime,
+                    Reason: reason
+                );
+
+                await hubContext.Clients.Group($"order:{orderId}").SendAsync("OrderStatusChanged", msgFinal);
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[Loi SimulateOrderProcessingAsync]: {ex.Message}");
+    }
+}
+
+// Hub SignalR quan ly dang ky/huy dang ky theo doi don hang
+public class OrderHub : Hub
+{
+    public async Task WatchOrder(string orderId)
+    {
+        await Groups.AddToGroupAsync(Context.ConnectionId, $"order:{orderId}");
+    }
+
+    public async Task UnwatchOrder(string orderId)
+    {
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, $"order:{orderId}");
+    }
+}
 
 // Lop quan ly luu tru don hang trong bo nho an toan luong (Thread-safe)
 public class OrderStore
@@ -78,6 +158,7 @@ public class OrderStore
 
     public OrderStore()
     {
+        var createdAt1 = DateTimeOffset.UtcNow.AddMinutes(-10);
         var order1 = new OrderDto(
             Id: Guid.Parse("11111111-1111-1111-1111-111111111111"),
             CustomerName: "Nguyen Van A",
@@ -88,9 +169,11 @@ public class OrderStore
             },
             TotalAmount: 2100000m,
             Status: "Pending",
-            CreatedAt: DateTimeOffset.UtcNow.AddMinutes(-10)
+            CreatedAt: createdAt1,
+            UpdatedAt: createdAt1
         );
 
+        var createdAt2 = DateTimeOffset.UtcNow.AddMinutes(-5);
         var order2 = new OrderDto(
             Id: Guid.Parse("22222222-2222-2222-2222-222222222222"),
             CustomerName: "Tran Thi B",
@@ -100,7 +183,8 @@ public class OrderStore
             },
             TotalAmount: 890000m,
             Status: "Pending",
-            CreatedAt: DateTimeOffset.UtcNow.AddMinutes(-5)
+            CreatedAt: createdAt2,
+            UpdatedAt: createdAt2
         );
 
         _orders.TryAdd(order1.Id, order1);
@@ -133,11 +217,29 @@ public class OrderStore
     {
         _orders.TryAdd(order.Id, order);
     }
+
+    public bool TryUpdateStatus(Guid id, string newStatus, DateTimeOffset updatedAt, out OrderDto? updatedOrder, out string oldStatus)
+    {
+        while (_orders.TryGetValue(id, out var current))
+        {
+            oldStatus = current.Status;
+            var updated = current with { Status = newStatus, UpdatedAt = updatedAt };
+            if (_orders.TryUpdate(id, updated, current))
+            {
+                updatedOrder = updated;
+                return true;
+            }
+        }
+        updatedOrder = null;
+        oldStatus = string.Empty;
+        return false;
+    }
 }
 
-// Khai bao cac record DTO theo chuan RESTful
+// Khai bao cac record DTO va Message theo yeu cau De tai 01
 public record OrderItemDto(string ProductId, string ProductName, int Quantity, decimal UnitPrice);
 public record CreateOrderItemRequest(string ProductId, string ProductName, int Quantity, decimal UnitPrice);
 public record CreateOrderRequest(string CustomerName, List<CreateOrderItemRequest> Items);
-public record OrderDto(Guid Id, string CustomerName, List<OrderItemDto> Items, decimal TotalAmount, string Status, DateTimeOffset CreatedAt);
+public record OrderDto(Guid Id, string CustomerName, List<OrderItemDto> Items, decimal TotalAmount, string Status, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+public record OrderStatusChangedMessage(Guid OrderId, string CustomerName, string OldStatus, string NewStatus, DateTimeOffset UpdatedAt, string? Reason);
 public record ApiError(string Code, string Message);

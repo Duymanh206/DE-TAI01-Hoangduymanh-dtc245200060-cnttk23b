@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Json;
+using Microsoft.AspNetCore.SignalR.Client;
 
 var apiBaseUrl = args.Length > 0 ? args[0] : "http://localhost:5000";
 
@@ -8,39 +10,56 @@ using var httpClient = new HttpClient
     BaseAddress = new Uri(apiBaseUrl)
 };
 
-Console.WriteLine($"========================================================");
-Console.WriteLine($"=== KET NOI ORDER.CLIENT TOI ORDER.API: {apiBaseUrl} ===");
-Console.WriteLine($"========================================================\n");
+Console.WriteLine("==========================================================================");
+Console.WriteLine($"=== KET NOI ORDER.CLIENT TOI ORDER.API & SIGNALR HUB: {apiBaseUrl} ===");
+Console.WriteLine("==========================================================================\n");
 
-// Buoc 1: Goi GET /orders de in danh sach don hang hien co
-Console.WriteLine("=== BUOC 1: GOI GET /orders DE IN DANH SACH DON HANG HIEN CO ===");
-var existingOrders = await httpClient.GetFromJsonAsync<List<OrderDto>>("/orders");
+// 1. Thiet lap ket noi SignalR Hub voi che do tu dong ket noi lai
+var hubUrl = $"{apiBaseUrl}/hubs/orders";
+await using var hubConnection = new HubConnectionBuilder()
+    .WithUrl(hubUrl)
+    .WithAutomaticReconnect()
+    .Build();
 
-if (existingOrders is not null && existingOrders.Count > 0)
+// Dictionary luu TaskCompletionSource de cho cac don hang dat trang thai cuoi (Completed/Failed)
+var completionSources = new ConcurrentDictionary<Guid, TaskCompletionSource<OrderStatusChangedMessage>>();
+
+// Dang ky lang nghe su kien thoi gian thuc OrderStatusChanged tu OrderHub
+hubConnection.On<OrderStatusChangedMessage>("OrderStatusChanged", message =>
 {
-    foreach (var order in existingOrders)
+    Console.WriteLine($"\n>>> [SIGNALR THONG BAO THOI GIAN THUC] <<<");
+    Console.WriteLine($"  Ma don hang     : {message.OrderId}");
+    Console.WriteLine($"  Khach hang      : {message.CustomerName}");
+    Console.WriteLine($"  Chuyen trang thai: {message.OldStatus} -> {message.NewStatus}");
+    Console.WriteLine($"  Thoi diem       : {message.UpdatedAt:yyyy-MM-dd HH:mm:ss.fff zzz}");
+    if (!string.IsNullOrEmpty(message.Reason))
     {
-        Console.WriteLine($"[Don hang: {order.Id}]");
-        Console.WriteLine($"  Khach hang   : {order.CustomerName}");
-        Console.WriteLine($"  Trang thai   : {order.Status}");
-        Console.WriteLine($"  Tong tien    : {order.TotalAmount:N0} VND");
-        Console.WriteLine($"  Thoi diem tao: {order.CreatedAt:yyyy-MM-dd HH:mm:ss zzz}");
-        Console.WriteLine("  Danh sach san pham:");
-        foreach (var item in order.Items)
-        {
-            Console.WriteLine($"    - {item.ProductName} ({item.ProductId}) | SL: {item.Quantity} | Don gia: {item.UnitPrice:N0} VND");
-        }
-        Console.WriteLine();
+        Console.WriteLine($"  Ly do chi tiet  : {message.Reason}");
     }
-}
-else
-{
-    Console.WriteLine("Khong co don hang nao.\n");
-}
+    Console.WriteLine("--------------------------------------------------------------------------");
 
-// Buoc 2: Gui POST /orders hop le, doc OrderDto vua tao va in thong tin
-Console.WriteLine("=== BUOC 2: GUI POST /orders HOP LE DE TAO DON HANG MOI ===");
-var validRequest = new CreateOrderRequest(
+    if (message.NewStatus is "Completed" or "Failed")
+    {
+        if (completionSources.TryGetValue(message.OrderId, out var tcs))
+        {
+            tcs.TrySetResult(message);
+        }
+    }
+});
+
+// Mo ket noi SignalR
+Console.WriteLine($"[1] Dang ket noi toi SignalR Hub: {hubUrl} ...");
+await hubConnection.StartAsync();
+Console.WriteLine($"  => Ket noi thanh cong! ConnectionId: {hubConnection.ConnectionId}\n");
+
+// ==========================================================================
+// KICH BAN 1: Tao don hang binh thuong -> Quan sat luong Pending -> Processing -> Completed
+// ==========================================================================
+Console.WriteLine("==========================================================================");
+Console.WriteLine("=== KICH BAN 1: TAO DON HANG HOP LE (Pending -> Processing -> Completed) ===");
+Console.WriteLine("==========================================================================");
+
+var normalOrderRequest = new CreateOrderRequest(
     CustomerName: "Pham Minh Hoang",
     Items: new List<CreateOrderItemRequest>
     {
@@ -49,77 +68,121 @@ var validRequest = new CreateOrderRequest(
     }
 );
 
-var createResponse = await httpClient.PostAsJsonAsync("/orders", validRequest);
-OrderDto? createdOrder = null;
-
-if (createResponse.StatusCode == HttpStatusCode.Created)
+Console.WriteLine("Goi POST /orders de tao don hang...");
+var response1 = await httpClient.PostAsJsonAsync("/orders", normalOrderRequest);
+if (response1.StatusCode == HttpStatusCode.Created)
 {
-    createdOrder = await createResponse.Content.ReadFromJsonAsync<OrderDto>();
-    Console.WriteLine("Tao don hang thanh cong (201 Created):");
-    Console.WriteLine($"  - Id         : {createdOrder?.Id}");
-    Console.WriteLine($"  - Khach hang : {createdOrder?.CustomerName}");
-    Console.WriteLine($"  - Trang thai : {createdOrder?.Status}");
-    Console.WriteLine($"  - Tong tien  : {createdOrder?.TotalAmount:N0} VND");
-    Console.WriteLine($"  - Thoi diem  : {createdOrder?.CreatedAt:yyyy-MM-dd HH:mm:ss zzz}\n");
+    var order1 = await response1.Content.ReadFromJsonAsync<OrderDto>();
+    Console.WriteLine($"Tao thanh cong don hang (201 Created):");
+    Console.WriteLine($"  - Id         : {order1?.Id}");
+    Console.WriteLine($"  - Khach hang : {order1?.CustomerName}");
+    Console.WriteLine($"  - Trang thai : {order1?.Status}");
+    Console.WriteLine($"  - Tong tien  : {order1?.TotalAmount:N0} VND");
+
+    if (order1 is not null)
+    {
+        var tcs1 = new TaskCompletionSource<OrderStatusChangedMessage>();
+        completionSources[order1.Id] = tcs1;
+
+        // Goi WatchOrder tren Hub de dang ky vao group order:{orderId}
+        Console.WriteLine($"Goi Hub.WatchOrder(\"{order1.Id}\") de nhan thong bao trang thai...");
+        await hubConnection.InvokeAsync("WatchOrder", order1.Id.ToString());
+
+        Console.WriteLine("Dang cho SignalR day thong bao cap nhat trang thai...\n");
+        var finalMsg1 = await tcs1.Task;
+        Console.WriteLine($"\n[Kich ban 1 Hoan tat] Don hang {order1.Id} da dat trang thai cuoi: {finalMsg1.NewStatus}");
+
+        // Goi GET /orders/{id} qua REST de xac nhan du lieu luu tren server
+        Console.WriteLine("\nGoi GET /orders/{id} qua REST de xac minh trang thai tren server...");
+        var getResponse = await httpClient.GetAsync($"/orders/{order1.Id}");
+        if (getResponse.IsSuccessStatusCode)
+        {
+            var serverOrder = await getResponse.Content.ReadFromJsonAsync<OrderDto>();
+            Console.WriteLine($"  - Id server         : {serverOrder?.Id}");
+            Console.WriteLine($"  - Trang thai server : {serverOrder?.Status}");
+            Console.WriteLine($"  - Thoi diem tao     : {serverOrder?.CreatedAt:yyyy-MM-dd HH:mm:ss.fff zzz}");
+            Console.WriteLine($"  - Thoi diem cap nhat: {serverOrder?.UpdatedAt:yyyy-MM-dd HH:mm:ss.fff zzz}");
+            Console.WriteLine($"  => Xac nhan REST API va SignalR dong bo trang thai ({serverOrder?.Status}).");
+        }
+
+        // Huy theo doi don hang
+        await hubConnection.InvokeAsync("UnwatchOrder", order1.Id.ToString());
+    }
 }
 else
 {
     Console.WriteLine("Tao don hang that bai:");
-    await PrintApiErrorAsync(createResponse);
-    Console.WriteLine();
+    await PrintApiErrorAsync(response1);
 }
 
-// Buoc 3: Dung Id vua nhan duoc goi GET /orders/{id} de doc lai chi tiet don hang va xac nhan khop thong tin
-Console.WriteLine("=== BUOC 3: GOI GET /orders/{id} VOI ID VUA TAO DE XAC NHAN DU LIEU ===");
-if (createdOrder is not null)
-{
-    var getResponse = await httpClient.GetAsync($"/orders/{createdOrder.Id}");
-    if (getResponse.IsSuccessStatusCode)
+Console.WriteLine("\n");
+
+// ==========================================================================
+// KICH BAN 2: Tao don hang co san pham OUT_OF_STOCK -> Pending -> Processing -> Failed
+// ==========================================================================
+Console.WriteLine("==========================================================================");
+Console.WriteLine("=== KICH BAN 2: TAO DON HANG HET HANG (Pending -> Processing -> Failed) ===");
+Console.WriteLine("==========================================================================");
+
+var outOfStockRequest = new CreateOrderRequest(
+    CustomerName: "Dang Thi Mai",
+    Items: new List<CreateOrderItemRequest>
     {
-        var fetchedOrder = await getResponse.Content.ReadFromJsonAsync<OrderDto>();
-        Console.WriteLine($"Doc thanh cong don hang tu server:");
-        Console.WriteLine($"  - Id         : {fetchedOrder?.Id}");
-        Console.WriteLine($"  - Khach hang : {fetchedOrder?.CustomerName}");
-        Console.WriteLine($"  - Trang thai : {fetchedOrder?.Status}");
-        Console.WriteLine($"  - Tong tien  : {fetchedOrder?.TotalAmount:N0} VND");
-
-        bool isMatched = fetchedOrder?.Id == createdOrder.Id &&
-                         fetchedOrder?.CustomerName == createdOrder.CustomerName &&
-                         fetchedOrder?.TotalAmount == createdOrder.TotalAmount;
-
-        Console.WriteLine($"  => Ket luan: Thong tin don hang {(isMatched ? "HOAN TOAN KHOP NHAU" : "KHONG KHOP")}\n");
+        new("P201", "CPU Core i9 the he moi", 1, 14000000m),
+        new("OUT_OF_STOCK", "VGA RTX 4090 24GB (Tam het hang)", 1, 48000000m)
     }
-    else
+);
+
+Console.WriteLine("Goi POST /orders tao don hang chua san pham het hang...");
+var response2 = await httpClient.PostAsJsonAsync("/orders", outOfStockRequest);
+if (response2.StatusCode == HttpStatusCode.Created)
+{
+    var order2 = await response2.Content.ReadFromJsonAsync<OrderDto>();
+    Console.WriteLine($"Tao thanh cong don hang (201 Created):");
+    Console.WriteLine($"  - Id         : {order2?.Id}");
+    Console.WriteLine($"  - Khach hang : {order2?.CustomerName}");
+    Console.WriteLine($"  - Trang thai : {order2?.Status}");
+    Console.WriteLine($"  - Tong tien  : {order2?.TotalAmount:N0} VND");
+
+    if (order2 is not null)
     {
-        Console.WriteLine("Doc don hang that bai:");
-        await PrintApiErrorAsync(getResponse);
-        Console.WriteLine();
+        var tcs2 = new TaskCompletionSource<OrderStatusChangedMessage>();
+        completionSources[order2.Id] = tcs2;
+
+        // Goi WatchOrder tren Hub de dang ky vao group order:{orderId}
+        Console.WriteLine($"Goi Hub.WatchOrder(\"{order2.Id}\") de nhan thong bao trang thai...");
+        await hubConnection.InvokeAsync("WatchOrder", order2.Id.ToString());
+
+        Console.WriteLine("Dang cho SignalR day thong bao cap nhat trang thai...\n");
+        var finalMsg2 = await tcs2.Task;
+        Console.WriteLine($"\n[Kich ban 2 Hoan tat] Don hang {order2.Id} da dat trang thai cuoi: {finalMsg2.NewStatus}");
+        Console.WriteLine($"  - Ly do that bai    : {finalMsg2.Reason}");
+
+        // Goi GET /orders/{id} qua REST de xac nhan du lieu luu tren server
+        Console.WriteLine("\nGoi GET /orders/{id} qua REST de xac minh trang thai tren server...");
+        var getResponse2 = await httpClient.GetAsync($"/orders/{order2.Id}");
+        if (getResponse2.IsSuccessStatusCode)
+        {
+            var serverOrder2 = await getResponse2.Content.ReadFromJsonAsync<OrderDto>();
+            Console.WriteLine($"  - Id server         : {serverOrder2?.Id}");
+            Console.WriteLine($"  - Trang thai server : {serverOrder2?.Status}");
+            Console.WriteLine($"  - Thoi diem cap nhat: {serverOrder2?.UpdatedAt:yyyy-MM-dd HH:mm:ss.fff zzz}");
+            Console.WriteLine($"  => Xac nhan REST API va SignalR dong bo trang thai ({serverOrder2?.Status}).");
+        }
+
+        // Huy theo doi don hang
+        await hubConnection.InvokeAsync("UnwatchOrder", order2.Id.ToString());
     }
 }
 else
 {
-    Console.WriteLine("Bo qua buoc 3 do buoc 2 tao don hang khong thanh cong.\n");
+    Console.WriteLine("Tao don hang that bai:");
+    await PrintApiErrorAsync(response2);
 }
 
-// Buoc 4: Co y gui POST /orders voi du lieu sai (CustomerName rong, Items rong) de in loi 400 BadRequest
-Console.WriteLine("=== BUOC 4: CO Y GUI POST /orders VOI DU LIEU SAI (CustomerName = \"\", Items = []) ===");
-var invalidRequest = new CreateOrderRequest(
-    CustomerName: "",
-    Items: new List<CreateOrderItemRequest>()
-);
-
-var badRequestResponse = await httpClient.PostAsJsonAsync("/orders", invalidRequest);
-Console.WriteLine($"Trang thai HTTP nhan duoc: {(int)badRequestResponse.StatusCode} {badRequestResponse.StatusCode}");
-await PrintApiErrorAsync(badRequestResponse);
-Console.WriteLine();
-
-// Buoc 5: Co y goi GET /orders/{Guid.NewGuid()} voi mot ID khong ton tai de in loi 404 NotFound
-Console.WriteLine("=== BUOC 5: CO Y GOI GET /orders/{Guid.NewGuid()} VOI ID KHONG TON TAI ===");
-var nonExistentId = Guid.NewGuid();
-var notFoundResponse = await httpClient.GetAsync($"/orders/{nonExistentId}");
-Console.WriteLine($"Trang thai HTTP nhan duoc: {(int)notFoundResponse.StatusCode} {notFoundResponse.StatusCode}");
-await PrintApiErrorAsync(notFoundResponse);
-Console.WriteLine();
+// Ngat ket noi SignalR truoc khi ket thuc chuong trinh
+await hubConnection.StopAsync();
+Console.WriteLine("\n=== DA HOAN TAT TOAN BO KICH BAN THOI GIAN THUC CHUONG 3 ===");
 
 // Ham ho tro doc va in thong tin loi ApiError tu phan hoi HTTP
 static async Task PrintApiErrorAsync(HttpResponseMessage response)
@@ -145,9 +208,10 @@ static async Task PrintApiErrorAsync(HttpResponseMessage response)
     }
 }
 
-// Khai bao cac record DTO tuong thich de trao doi du lieu voi Order.Api
+// Khai bao cac record DTO va Message tuong thich de trao doi du lieu voi Order.Api
 public record OrderItemDto(string ProductId, string ProductName, int Quantity, decimal UnitPrice);
 public record CreateOrderItemRequest(string ProductId, string ProductName, int Quantity, decimal UnitPrice);
 public record CreateOrderRequest(string CustomerName, List<CreateOrderItemRequest> Items);
-public record OrderDto(Guid Id, string CustomerName, List<OrderItemDto> Items, decimal TotalAmount, string Status, DateTimeOffset CreatedAt);
+public record OrderDto(Guid Id, string CustomerName, List<OrderItemDto> Items, decimal TotalAmount, string Status, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+public record OrderStatusChangedMessage(Guid OrderId, string CustomerName, string OldStatus, string NewStatus, DateTimeOffset UpdatedAt, string? Reason);
 public record ApiError(string Code, string Message);
